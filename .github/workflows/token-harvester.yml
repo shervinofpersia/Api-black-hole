@@ -1,0 +1,41 @@
+name: Token Harvester
+
+on:
+  schedule:
+    # هر 30 دقیقه
+    - cron: '*/30 * * * *'
+  workflow_dispatch:   # امکان اجرای دستی
+
+# اجازه دسترسی به محتوای ریپو برای commit
+permissions:
+  contents: write
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Run harvester script
+        run: bash harvest.sh
+        env:
+          # توکن‌های هاردکد (برای seed) از طریق متغیرهای محیطی هم رد می‌شوند
+          # اما اسکریپت خودش هاردکد داره، اینا فقط redundancy
+          SEED_GHO: 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
+          SEED_GHP1: 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
+          SEED_GHP2: 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
+
+      - name: Commit updated token bank
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add tokens.txt
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update token bank [skip ci]"
+            git push
+          fi
